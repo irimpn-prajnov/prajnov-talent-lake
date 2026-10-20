@@ -1,0 +1,4 @@
+boto3>=1.34
+ijson>=3.2
+requests>=2.31
+pdfplumber>=0.10
