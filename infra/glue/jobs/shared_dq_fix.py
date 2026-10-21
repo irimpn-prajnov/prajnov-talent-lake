@@ -170,11 +170,11 @@ def fix_dirty_certs(conn) -> dict:
             with conn.cursor() as cur:
                 cur.execute("""
                     UPDATE candidates SET
-                        certifications          = %s,
-                        verified_certifications = %s,
+                        certifications          = %s::text[],
+                        verified_certifications = %s::text[],
                         cert_verification_status = CASE
-                            WHEN cardinality(%s) > 0 THEN 'verified'
-                            WHEN cert_verification_status = 'verified' AND cardinality(%s) = 0
+                            WHEN cardinality(%s::text[]) > 0 THEN 'verified'
+                            WHEN cert_verification_status = 'verified' AND cardinality(%s::text[]) = 0
                             THEN 'checked_not_found'
                             ELSE cert_verification_status
                         END,

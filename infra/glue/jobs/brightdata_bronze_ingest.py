@@ -293,7 +293,7 @@ def run():
         logger.info("Processing: %s (%.1f MB)", key, f["size"] / 1e6)
 
         batch     = []
-        seen      = set()
+        seen      = set()   # capped at 200k entries then cleared — dedup within window
         errors    = 0
         batch_num = 0
         count     = 0
@@ -303,9 +303,13 @@ def run():
             try:
                 rec = normalize_record(raw, key)
                 uid = rec["linkedin_id"] or rec["linkedin_url"]
-                if not uid or uid in seen:
+                if not uid:
+                    continue
+                if uid in seen:
                     continue
                 seen.add(uid)
+                if len(seen) > 200_000:   # cap memory — reset dedup window
+                    seen = set()
                 batch.append(rec)
                 count += 1
                 if len(batch) >= BATCH_SIZE:

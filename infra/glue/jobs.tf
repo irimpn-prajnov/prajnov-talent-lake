@@ -176,8 +176,8 @@ resource "aws_glue_job" "brightdata_bronze_ingest" {
 
   default_arguments = local.brightdata_args
 
-  max_capacity = 0.0625
-  timeout      = 120   # 2 hours — 1.8 GB JSON file streams slowly
+  max_capacity = 1.0   # G.1X — 4 vCPU / 16 GB — needed for 1.8 GB file + seen set
+  timeout      = 120
 
   tags = {
     project = "prajnov-talent-lake"
@@ -201,7 +201,7 @@ resource "aws_glue_job" "brightdata_silver_normalize" {
 
   default_arguments = local.brightdata_args
 
-  max_capacity = 0.0625
+  max_capacity = 1.0
   timeout      = 60
 
   tags = {
@@ -226,7 +226,7 @@ resource "aws_glue_job" "brightdata_gold_upsert" {
 
   default_arguments = local.brightdata_args
 
-  max_capacity = 0.0625
+  max_capacity = 1.0
   timeout      = 60
 
   tags = {
