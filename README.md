@@ -14,6 +14,7 @@ and GenAI matching to power the Prajnov AI Recruiter.
   - [Credly Pipeline](#credly-pipeline)
   - [BrightData Pipeline](#brightdata-pipeline)
   - [Embed Pipeline](#embed-pipeline)
+- [Glue Jobs — Detailed](#glue-jobs--detailed)
 - [CI/CD Setup](#cicd-setup)
 - [Local Development](#local-development)
 - [Running Pipelines Manually](#running-pipelines-manually)
@@ -37,13 +38,18 @@ and GenAI matching to power the Prajnov AI Recruiter.
   │              S3 Bronze  (raw, immutable)             │
   │  s3://prajnov-talent-lake/bronze/                    │
   │  ├── discovery/credly/certs/{slug}/consolidated/     │
-  │  └── brightdata/                                     │
+  │  └── candidates/brightdata/{dataset}/{date}/         │
   └──────────────────────┬──────────────────────────────┘
                          │  Glue Python Shell jobs
                          ▼
   ┌─────────────────────────────────────────────────────┐
   │              S3 Silver  (normalized Parquet)         │
   │  s3://prajnov-talent-lake/silver/                    │
+  │  ├── candidate/source=brightdata/                    │
+  │  ├── candidate_certification/source=brightdata/      │
+  │  ├── candidate_skill/source=brightdata/              │
+  │  ├── candidate_experience/source=brightdata/         │
+  │  └── candidate_education/source=brightdata/          │
   └──────────────────────┬──────────────────────────────┘
                          │
                          ▼
@@ -89,27 +95,14 @@ and GenAI matching to power the Prajnov AI Recruiter.
 Scrapes ServiceNow certification earners from Credly, enriches candidate records with verified certifications.
 
 ```
-Bronze (credly_bronze_ingest)
-  └── Scrapes 40+ SN cert slugs from Credly directory
-  └── Output: s3://prajnov-talent-lake/bronze/discovery/credly/certs/{slug}/consolidated/all.json
-
-Silver (credly_silver_enrich)
-  └── Matches Credly earners against BrightData candidates by name/LinkedIn
-  └── Writes verified_certifications[] to candidates table
-
-DQ Fix (shared_dq_fix)
-  └── Normalizes dirty cert codes (e.g. "cis-itsm" → "CIS-ITSM")
-  └── Deduplicates by linkedin_id, fixes location fields
-
-Gold Merge (shared_gold_merge)
-  └── Entity resolution across all sources → gold candidates table
-
-Embed Upsert (shared_embed_upsert)
-  └── Assembles profile text → Bedrock Titan v2 → embedding_titan column
+Step 1 — Bronze  (credly_bronze_ingest)
+Step 2 — Silver  (credly_silver_enrich)
+Step 3 — DQ Fix  (shared_dq_fix)
+Step 4 — Gold    (shared_gold_merge)
+Step 5 — Embed   (shared_embed_upsert)
 ```
 
-**Schedule**: Every Sunday 01:00 UTC via `prajnov-talent-lake-pipeline` Step Functions state machine.
-
+**Schedule**: Every Sunday 01:00 UTC
 **Step Functions ARN**: `arn:aws:states:ap-south-1:201727487159:stateMachine:prajnov-talent-lake-pipeline`
 
 ---
@@ -119,61 +112,222 @@ Embed Upsert (shared_embed_upsert)
 Ingests LinkedIn profile data from BrightData datasets bucket, normalizes and upserts into candidates table.
 
 ```
-Bronze (brightdata_bronze_ingest)
-  └── Scans s3://prajnov-brightdata-datasets for new files (ETag watermark)
-  └── Streams into bronze JSONL batches
-
-Silver (brightdata_silver_normalize)
-  └── Normalizes JSONL → 5 Parquet tables (profiles, experience, education, skills, certs)
-
-Gold (brightdata_gold_upsert)
-  └── Upserts silver into candidates table — entity resolution by linkedin_id
-
-Embed Upsert (shared_embed_upsert)
-  └── Assembles profile text → Bedrock Titan v2 → embedding_titan column
+Step 1 — Bronze  (brightdata_bronze_ingest)
+Step 2 — Silver  (brightdata_silver_normalize)
+Step 3 — Gold    (brightdata_gold_upsert)
+Step 4 — Embed   (shared_embed_upsert)
 ```
 
-**Schedule**: Every Sunday 02:00 UTC via `prajnov-brightdata-pipeline` Step Functions state machine.
-
+**Schedule**: Every Sunday 02:00 UTC
 **Step Functions ARN**: `arn:aws:states:ap-south-1:201727487159:stateMachine:prajnov-brightdata-pipeline`
 
 ---
 
 ### Embed Pipeline
 
-Standalone embedding job that can be run independently to backfill or catch up on unembedded candidates.
+Standalone backfill job — embeds all candidates where `embedding_titan IS NULL`.
 
 ```
 shared_embed_upsert
-  └── Reads candidates WHERE embedding_titan IS NULL (up to MAX_ROWS=10000)
-  └── Assembles profile text: title + company + location + certs + skills + about + experience
-  └── Calls Bedrock Titan Embeddings v2 (20 threads, per-thread boto3 client)
+  └── Reads up to 10,000 candidates with no embedding
+  └── Assembles profile text per candidate
+  └── Calls Bedrock Titan v2 (20 threads, per-thread client)
   └── Writes 1024-dim vector to embedding_titan column
-  └── Refreshes candidates_search materialized view on completion
+  └── Refreshes candidates_search materialized view
 ```
 
-**Glue job**: `prajnov-shared-embed-upsert`
-**Timeout**: 240 mins | **Capacity**: 0.0625 DPU (1 GB RAM)
-
-To run the embed loop until all candidates are embedded:
+To run until all candidates are embedded:
 
 ```bash
-# Start loop (auto-retriggers until pending = 0)
 nohup bash infra/glue/embed_loop.sh > /tmp/embed_loop.log 2>&1 &
-
-# Monitor
 tail -f /tmp/embed_loop.log
-
-# Check DB progress directly
-ssh -i ~/.ssh/prajnov-recruiter ec2-user@<ec2-ip> 'python3 -c "
-import psycopg2
-conn = psycopg2.connect(host=\"ai-recruiter.c7q8sg00wqte.ap-south-1.rds.amazonaws.com\", dbname=\"recruiter\", user=\"prajnov\", password=\"<password>\")
-cur = conn.cursor()
-cur.execute(\"SELECT COUNT(*) FILTER (WHERE embedding_titan IS NOT NULL), COUNT(*) FILTER (WHERE embedding_titan IS NULL) FROM candidates\")
-r = cur.fetchone()
-print(f\"embedded={r[0]}  pending={r[1]}\")
-"'
 ```
+
+---
+
+## Glue Jobs — Detailed
+
+### 1. `prajnov-credly-bronze-ingest`
+
+**What it does**: Scrapes all ServiceNow certification earners from the Credly public directory API and writes them to S3 bronze.
+
+**How it works**:
+- Iterates over 43 ServiceNow cert types (CSA, CAD, CTA, all CIS-* and SUITE-* certs)
+- For each cert, paginates through the Credly directory API (`/api/v1/directory`) filtering by badge name
+- Runs 4 certs in parallel (ThreadPoolExecutor) with 0.3s rate limiting per page
+- Incremental — loads the existing consolidated file per cert, only adds new earners by `credly_id`
+- Writes one consolidated JSON array per cert: `bronze/discovery/credly/certs/{slug}/consolidated/all.json`
+- Writes a run manifest with per-cert counts to `bronze/discovery/credly/_manifests/`
+
+**Output**: ~43 consolidated JSON files in S3 bronze, one per cert slug
+**Capacity**: 0.0625 DPU | **Timeout**: 3 hours
+
+---
+
+### 2. `prajnov-credly-silver-enrich`
+
+**What it does**: Matches Credly earners against existing candidates in the DB and enriches them with verified certifications. Inserts unmatched earners as new candidate rows.
+
+**How it works**:
+- Loads all 43 consolidated bronze files from S3
+- Deduplicates by `credly_id` across all certs — one record per person with all their cert codes
+- Loads records into a temp staging table in the DB
+- **Tier 1 match**: exact `linkedin_id` match — highest confidence
+- **Tier 2 match**: normalized name + state match — used only when Tier 1 fails
+- For matched candidates: appends cert codes to `verified_certifications[]`, sets `cert_verification_status = 'credly_verified'`
+- For unmatched earners: inserts as new `source='credly'` candidates with `verified_certifications` populated
+- Creates a GIN index on `verified_certifications` for fast cert-based filtering
+
+**Output**: Updated `verified_certifications[]` on matched candidates, new rows for unmatched Credly earners
+**Capacity**: 0.0625 DPU | **Timeout**: 2 hours
+
+---
+
+### 3. `prajnov-shared-dq-fix`
+
+**What it does**: Fixes data quality issues across the candidates table — normalizes dirty cert codes, deduplicates by LinkedIn ID, recalculates experience years, and re-parses broken location fields.
+
+**How it works**:
+
+**Fix 1 — Normalize dirty cert codes**:
+- Reads all candidates with non-null `certifications` or `verified_certifications`
+- Maps dirty/verbose cert strings (e.g. `"cis-itsm certified implementation specialist - it service management"`) to canonical codes (e.g. `"cis-itsm"`)
+- Removes micro-certs, suite certs, and unrecognized codes from `verified_certifications`
+- Batch-updates via a temp table — single SQL UPDATE
+
+**Fix 2 — Deduplicate by linkedin_id**:
+- Finds all `linkedin_id` values with more than one candidate row
+- Merges `verified_certifications`, `certifications`, `skills`, and `about` from all duplicate rows into the canonical row (source priority: credly > signalhire > brightdata)
+- Flags non-canonical duplicates with `source = source || '+duplicate'`
+- Uses a single CTE-based SQL pass — no correlated subqueries
+
+**Fix 3 — Recalculate experience_years**:
+- Finds candidates where `experience_years` is NULL, 0, or negative
+- Derives years from the earliest `start_year` in the `experience` JSON array
+- Caps at 40 years, minimum 1
+
+**Fix 4 — Re-parse broken locations**:
+- Finds candidates with a `location_raw` value but missing `state`
+- Parses `"City, State"` format using a full US state name/abbreviation map
+- Updates `city`, `state`, `country` fields
+
+**Output**: Cleaned `candidates` table — normalized certs, deduped rows, corrected locations and experience years
+**Capacity**: 0.0625 DPU | **Timeout**: 1 hour
+
+---
+
+### 4. `prajnov-shared-gold-merge`
+
+**What it does**: Entity resolution across all sources — merges duplicate candidate rows (same person from Credly + BrightData + SignalHire) into a single gold record.
+
+**How it works**:
+- Finds all `linkedin_id` values with more than one candidate row
+- For each duplicate group, fetches all rows sorted by source priority (credly > signalhire > brightdata)
+- Merges fields using source-specific rules:
+  - `verified_certifications` — union from ALL sources (Credly wins)
+  - `current_title`, `current_company` — BrightData wins (most up-to-date)
+  - `about`, `experience`, `experience_text` — longest value wins
+  - `skills`, `companies` — union from all sources
+  - `email`, `phone` — SignalHire wins
+  - `cert_verification_status` — highest confidence wins (verified > checked_not_found > unverified)
+- Upserts the merged record back to the canonical row
+- Flags duplicate rows with `source = source || '+duplicate'`
+- Calculates a `data_quality_score` (0–1) based on field completeness
+
+**Output**: Merged gold candidate records, duplicate rows flagged
+**Capacity**: 0.0625 DPU | **Timeout**: 1 hour
+
+---
+
+### 5. `prajnov-brightdata-bronze-ingest`
+
+**What it does**: Scans the BrightData source bucket for new LinkedIn dataset files and streams them into S3 bronze as batched JSONL files.
+
+**How it works**:
+- Lists all `.json` and `.parquet` files in `s3://prajnov-brightdata-datasets/`
+- Uses an ETag-based watermark (`glue-state/brightdata_bronze_ingest/processed_files.json`) — each file is only processed once
+- Streams large files record-by-record using `ijson` (JSON) or PyArrow (Parquet) — never loads full file into memory
+- Normalizes each raw BrightData record into a consistent bronze schema:
+  - Standardizes LinkedIn URL format
+  - Parses `experience[]` with `start_year`/`end_year` extracted from date strings
+  - Derives `experience_years` from earliest start year
+  - Extracts `skills[]`, `certifications[]`, `education[]`
+- Deduplicates by `linkedin_id` within each file (capped at 200k seen set)
+- Flushes every 1,000 records as a JSONL batch to `bronze/candidates/brightdata/{slug}/{date}/batch_{n}.jsonl`
+- Updates the ETag watermark on completion
+
+**Output**: JSONL batch files in S3 bronze, one batch per 1,000 records
+**Capacity**: 1.0 DPU (4 vCPU / 16 GB — needed for large dataset files) | **Timeout**: 2 hours
+
+---
+
+### 6. `prajnov-brightdata-silver-normalize`
+
+**What it does**: Reads all new bronze JSONL batches since the last run and normalizes them into 5 structured Parquet tables in S3 silver.
+
+**How it works**:
+- Uses a timestamp watermark (`glue-state/brightdata_silver_normalize/last_run.json`) to find new bronze JSONL files
+- Fetches all new JSONL files in parallel (20 threads)
+- Deduplicates by `linkedin_id` — one silver row per person
+- For each record, produces 5 output tables:
+  - `silver/candidate/` — core profile fields (name, title, company, location, about)
+  - `silver/candidate_certification/` — normalized cert codes with `verification_status='self_reported'`
+  - `silver/candidate_skill/` — one row per skill with confidence score
+  - `silver/candidate_experience/` — one row per job with start/end years
+  - `silver/candidate_education/` — one row per institution
+- Normalizes cert strings to canonical codes (e.g. `"it service management"` → `"cis-itsm"`)
+- Parses location into `city`, `state`, `country` using US state map + country code map
+- Writes each table as a Snappy-compressed Parquet file
+
+**Output**: 5 Parquet files per run in S3 silver
+**Capacity**: 1.0 DPU | **Timeout**: 1 hour
+
+---
+
+### 7. `prajnov-brightdata-gold-upsert`
+
+**What it does**: Reads silver Parquet files and upserts candidate records into the gold `candidates` table in Aurora PostgreSQL.
+
+**How it works**:
+- Uses a timestamp watermark to find new silver Parquet files since last run
+- Loads all 5 silver tables and indexes `certifications`, `skills`, `experience`, `education` by `candidate_id`
+- Builds a `uid = "bd_{linkedin_id}"` for each candidate
+- Assembles `experience_text` as a pipe-delimited string of `"title at company"` entries
+- Upserts in batches of 2,000 using `ON CONFLICT (uid) DO UPDATE`:
+  - New candidates: inserted with `source='brightdata'`, `verified_certifications=[]`, `cert_verification_status='unverified'`
+  - Existing candidates: updates title/company, about (if longer), skills (if more), experience, education, email/phone (if missing)
+  - Never overwrites `verified_certifications` — Credly-verified certs are protected
+  - Appends `+brightdata` to `source` field if not already present
+
+**Output**: Upserted candidate rows in Aurora PostgreSQL
+**Capacity**: 1.0 DPU | **Timeout**: 2 hours
+
+---
+
+### 8. `prajnov-shared-embed-upsert`
+
+**What it does**: Generates 1024-dimensional vector embeddings for all candidates without an embedding and writes them to the `embedding_titan` column for semantic search.
+
+**How it works**:
+- Reads up to 10,000 candidates where `embedding_titan IS NULL`, ordered by `added_at`
+- Assembles a profile text string per candidate from:
+  - `current_title at current_company`
+  - `headline`
+  - `Location: city, state`
+  - `Experience: N years`
+  - `Certifications: cert1, cert2, ...` (from `verified_certifications`)
+  - `Skills: skill1, skill2, ...` (first 40 skills)
+  - `about` (first 1,000 chars)
+  - `experience_text` (first 1,500 chars)
+- Calls Bedrock Titan Embeddings v2 (`amazon.titan-embed-text-v2:0`) with 20 parallel threads
+- Each thread creates its own `boto3` Bedrock client (shared client causes deadlock)
+- Retries on throttling with exponential backoff (up to 5 attempts)
+- Flushes DB writes every 50 embeddings
+- On completion, refreshes the `candidates_search` materialized view so AIR search reflects new data
+
+**Output**: `embedding_titan` column populated (1024-dim vector), `candidates_search` view refreshed
+**Capacity**: 0.0625 DPU | **Timeout**: 4 hours
+
 
 ---
 
@@ -182,7 +336,7 @@ print(f\"embedded={r[0]}  pending={r[1]}\")
 The CI/CD pipeline uses **GitHub Actions** (`.github/workflows/deploy.yml`).
 
 On every push to `main` it:
-1. Detects changed Glue scripts and syncs them to S3
+1. Detects changed Glue scripts and syncs only those to S3
 2. Runs `terraform plan` + `terraform apply` for any infra changes
 
 On pull requests it runs `terraform plan` only (no apply).
@@ -199,22 +353,15 @@ Go to **Settings → Secrets and variables → Actions** in the GitHub repo and 
 
 ### IAM permissions needed for the CI/CD IAM user
 
-The IAM user used by GitHub Actions needs at minimum:
-
 ```json
 {
   "Effect": "Allow",
   "Action": [
     "s3:PutObject", "s3:GetObject", "s3:ListBucket",
-    "glue:*",
-    "states:*",
+    "glue:*", "states:*",
     "iam:GetRole", "iam:PassRole",
-    "scheduler:*",
-    "sns:*",
-    "events:*",
-    "cloudwatch:*",
-    "secretsmanager:GetSecretValue",
-    "athena:*"
+    "scheduler:*", "sns:*", "events:*",
+    "cloudwatch:*", "secretsmanager:GetSecretValue", "athena:*"
   ],
   "Resource": "*"
 }
@@ -226,22 +373,18 @@ The IAM user used by GitHub Actions needs at minimum:
 git push → main
     │
     ├── deploy-scripts job
-    │     └── git diff HEAD~1 HEAD -- infra/glue/jobs/*.py
+    │     └── git diff HEAD~1 HEAD -- infra/glue/jobs/*.py ingestion/common.py
     │     └── aws s3 cp <changed>.py s3://prajnov-talent-lake/glue-scripts/
     │
     └── terraform job (runs after deploy-scripts)
-          └── terraform init
-          └── terraform validate
-          └── terraform plan
-          └── terraform apply  ← only on push to main
+          └── terraform init → validate → plan → apply (main only)
 ```
 
-### Terraform remote state (recommended next step)
+### Terraform remote state (recommended)
 
-Currently Terraform state is stored locally (`infra/glue/terraform.tfstate`). For team use, migrate to S3 backend:
+Currently Terraform state is stored locally. For team use, migrate to S3 backend:
 
 ```hcl
-# Add to infra/glue/main.tf
 terraform {
   backend "s3" {
     bucket  = "prajnov-talent-lake"
@@ -283,18 +426,11 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Environment variables
-
-```bash
-cp ingestion/.env.example ingestion/.env
-# Fill in API keys — see .env.example for required vars
-```
-
 ---
 
 ## Running Pipelines Manually
 
-### Trigger full Credly pipeline (Step Functions)
+### Trigger full Credly pipeline
 
 ```bash
 aws stepfunctions start-execution \
@@ -315,7 +451,6 @@ aws stepfunctions start-execution \
 ### Trigger individual Glue jobs
 
 ```bash
-# Replace JOB_NAME with any of the jobs listed below
 aws glue start-job-run \
   --job-name JOB_NAME \
   --profile 201727487159_AdministratorAccess \
@@ -324,14 +459,14 @@ aws glue start-job-run \
 
 | Job Name | Description |
 |---|---|
-| `prajnov-credly-bronze-ingest` | Scrape Credly cert earners |
-| `prajnov-credly-silver-enrich` | Match Credly → candidates, enrich certs |
-| `prajnov-shared-dq-fix` | Normalize cert codes, dedup, fix locations |
-| `prajnov-shared-gold-merge` | Entity resolution → gold candidates |
-| `prajnov-brightdata-bronze-ingest` | Ingest BrightData datasets → bronze JSONL |
-| `prajnov-brightdata-silver-normalize` | Normalize bronze → silver Parquet |
+| `prajnov-credly-bronze-ingest` | Scrape all 43 SN certs from Credly → S3 bronze |
+| `prajnov-credly-silver-enrich` | Match Credly earners → candidates, enrich verified_certifications |
+| `prajnov-shared-dq-fix` | Normalize cert codes, dedup, fix locations + experience_years |
+| `prajnov-shared-gold-merge` | Entity resolution → merge multi-source duplicates |
+| `prajnov-brightdata-bronze-ingest` | Ingest BrightData datasets → bronze JSONL batches |
+| `prajnov-brightdata-silver-normalize` | Normalize bronze → 5 silver Parquet tables |
 | `prajnov-brightdata-gold-upsert` | Upsert silver → candidates table |
-| `prajnov-shared-embed-upsert` | Generate Bedrock embeddings → embedding_titan |
+| `prajnov-shared-embed-upsert` | Generate Bedrock Titan v2 embeddings → embedding_titan |
 
 ### Check job status
 
@@ -351,6 +486,16 @@ aws glue get-job-runs \
 aws s3 cp infra/glue/jobs/shared_embed_upsert.py \
   s3://prajnov-talent-lake/glue-scripts/shared_embed_upsert.py \
   --profile 201727487159_AdministratorAccess
+```
+
+### Run embed backfill loop
+
+```bash
+# Auto-retriggers until all candidates are embedded
+nohup bash infra/glue/embed_loop.sh > /tmp/embed_loop.log 2>&1 &
+
+# Monitor
+tail -f /tmp/embed_loop.log
 ```
 
 ---
@@ -374,7 +519,7 @@ aws logs get-log-events \
 
 ### Pipeline notifications
 
-SNS email alerts are sent to `navin@prajnov.com` on:
+SNS email alerts sent to `navin@prajnov.com` on:
 - Pipeline SUCCEEDED
 - Pipeline FAILED / TIMED_OUT / ABORTED
 
@@ -413,9 +558,6 @@ terraform plan
 
 # Apply
 terraform apply
-
-# Destroy (careful!)
-terraform destroy
 ```
 
 ### What Terraform manages
@@ -433,7 +575,7 @@ terraform destroy
 - S3 bucket `prajnov-talent-lake` (created manually)
 - Aurora RDS cluster (managed separately in `infra/rds/`)
 - EC2 instance `prajnov-recruiter-v2` (web app host)
-- Terraform state backend (currently local — see [remote state](#terraform-remote-state-recommended-next-step))
+- Terraform state backend (currently local)
 
 ---
 
@@ -452,7 +594,7 @@ prajnov-talent-lake/
 │
 ├── infra/
 │   ├── glue/
-│   │   ├── jobs/               # All Glue Python Shell job scripts
+│   │   ├── jobs/               # All 8 Glue Python Shell job scripts
 │   │   │   ├── credly_bronze_ingest.py
 │   │   │   ├── credly_silver_enrich.py
 │   │   │   ├── shared_dq_fix.py
@@ -466,8 +608,8 @@ prajnov-talent-lake/
 │   │   ├── schedule.tf         # Step Functions, EventBridge, SNS, CloudWatch
 │   │   ├── variables.tf        # Region, bucket, DB config, cert list
 │   │   ├── outputs.tf          # Job names, pipeline ARNs
-│   │   └── embed_loop.sh       # Local loop script — retriggers embed job until done
-│   ├── iam/                    # (placeholder — IAM managed in main.tf)
+│   │   └── embed_loop.sh       # Local loop — retriggers embed job until done
+│   ├── iam/
 │   └── rds/
 │       ├── main.tf             # Aurora PostgreSQL Serverless v2
 │       └── schema.sql          # candidates table + pgvector setup
@@ -480,7 +622,6 @@ prajnov-talent-lake/
 │   ├── requirements.txt
 │   └── .env.example
 │
-├── processing/                 # Ad-hoc processing scripts
 ├── schemas/                    # Data model documentation
 ├── search/                     # Hybrid search & matching (planned)
 ├── agents/                     # GenAI recruiter agents (planned)

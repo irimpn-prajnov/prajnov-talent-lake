@@ -211,7 +211,6 @@ def fix_duplicates(conn) -> dict:
     stats = {"merged": 0, "removed": 0}
 
     with conn.cursor() as cur:
-        # Count duplicate groups first
         cur.execute("""
             SELECT COUNT(*) AS cnt FROM (
                 SELECT linkedin_id FROM candidates
@@ -226,7 +225,8 @@ def fix_duplicates(conn) -> dict:
         return stats
 
     with conn.cursor() as cur:
-        # Single SQL pass: merge certs/skills/about into canonical, flag dupes
+        # Single pass: rank all rows, aggregate all arrays per linkedin_id in one scan,
+        # then update canonical rows only — no correlated subqueries
         cur.execute("""
             WITH ranked AS (
                 SELECT uid, linkedin_id,
@@ -242,43 +242,29 @@ def fix_duplicates(conn) -> dict:
                 FROM candidates
                 WHERE linkedin_id != '' AND linkedin_id IS NOT NULL
             ),
-            canonical AS (SELECT uid, linkedin_id FROM ranked WHERE rn = 1),
-            merged AS (
+            group_agg AS (
                 SELECT
-                    c.uid,
-                    (
-                        SELECT array_agg(DISTINCT v ORDER BY v)
-                        FROM candidates d
-                        JOIN ranked r ON r.uid = d.uid AND r.linkedin_id = c.linkedin_id
-                        CROSS JOIN unnest(COALESCE(d.verified_certifications, ARRAY[]::text[])) v
-                    ) AS merged_ver,
-                    (
-                        SELECT array_agg(DISTINCT v ORDER BY v)
-                        FROM candidates d
-                        JOIN ranked r ON r.uid = d.uid AND r.linkedin_id = c.linkedin_id
-                        CROSS JOIN unnest(COALESCE(d.certifications, ARRAY[]::text[])) v
-                    ) AS merged_raw,
-                    (
-                        SELECT array_agg(DISTINCT v ORDER BY v)
-                        FROM candidates d
-                        JOIN ranked r ON r.uid = d.uid AND r.linkedin_id = c.linkedin_id
-                        CROSS JOIN unnest(COALESCE(d.skills, ARRAY[]::text[])) v
-                    ) AS merged_skills,
-                    (
-                        SELECT about FROM candidates d
-                        JOIN ranked r ON r.uid = d.uid AND r.linkedin_id = c.linkedin_id
-                        WHERE length(d.about) > 0
-                        ORDER BY length(d.about) DESC LIMIT 1
-                    ) AS best_about
-                FROM canonical c
+                    r.linkedin_id,
+                    array_agg(DISTINCT vc ORDER BY vc) FILTER (WHERE vc IS NOT NULL) AS merged_ver,
+                    array_agg(DISTINCT rc ORDER BY rc) FILTER (WHERE rc IS NOT NULL) AS merged_raw,
+                    array_agg(DISTINCT sk ORDER BY sk) FILTER (WHERE sk IS NOT NULL) AS merged_skills,
+                    (array_agg(c.about ORDER BY length(c.about) DESC))[1]            AS best_about
+                FROM ranked r
+                JOIN candidates c ON c.uid = r.uid
+                LEFT JOIN unnest(COALESCE(c.verified_certifications, ARRAY[]::text[])) AS vc ON true
+                LEFT JOIN unnest(COALESCE(c.certifications,           ARRAY[]::text[])) AS rc ON true
+                LEFT JOIN unnest(COALESCE(c.skills,                   ARRAY[]::text[])) AS sk ON true
+                GROUP BY r.linkedin_id
             )
             UPDATE candidates SET
-                verified_certifications = m.merged_ver,
-                certifications          = m.merged_raw,
-                skills                  = m.merged_skills,
-                about                   = COALESCE(m.best_about, candidates.about),
+                verified_certifications = g.merged_ver,
+                certifications          = g.merged_raw,
+                skills                  = g.merged_skills,
+                about                   = COALESCE(NULLIF(g.best_about, ''), candidates.about),
                 updated_at              = now()
-            FROM merged m WHERE candidates.uid = m.uid
+            FROM ranked r
+            JOIN group_agg g ON g.linkedin_id = r.linkedin_id
+            WHERE candidates.uid = r.uid AND r.rn = 1
         """)
 
         # Flag non-canonical dupes
