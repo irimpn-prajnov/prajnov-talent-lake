@@ -16,6 +16,7 @@ Schedule: Weekly (Sunday 04:00 UTC) — runs after cert-verify job
 import json, logging, os, sys, re
 from datetime import datetime, timezone
 
+import boto3
 import psycopg2, psycopg2.extras
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -29,55 +30,64 @@ def _arg(name, default=""):
     except (ValueError, IndexError):
         return os.getenv(name, default)
 
+REGION  = _arg("AWS_REGION",        "ap-south-1")
 DB_HOST = _arg("PGVECTOR_HOST",     "ai-recruiter.c7q8sg00wqte.ap-south-1.rds.amazonaws.com")
 DB_NAME = _arg("PGVECTOR_DB",       "recruiter")
 DB_USER = _arg("PGVECTOR_USER",     "prajnov")
-DB_PASS = _arg("PGVECTOR_PASSWORD", "")
+SECRET_ARN = _arg("PGVECTOR_SECRET_ARN", "arn:aws:secretsmanager:ap-south-1:201727487159:secret:prajnov/recruiter-F8sc3X")
+
+def _get_db_pass() -> str:
+    env_pass = os.getenv("PGVECTOR_PASSWORD", "")
+    if env_pass:
+        return env_pass
+    client = boto3.client("secretsmanager", region_name=REGION)
+    secret = json.loads(client.get_secret_value(SecretId=SECRET_ARN)["SecretString"])
+    return secret.get("PGVECTOR_PASSWORD", "")
 
 
 def db_conn():
     return psycopg2.connect(
-        host=DB_HOST, dbname=DB_NAME, user=DB_USER, password=DB_PASS,
+        host=DB_HOST, dbname=DB_NAME, user=DB_USER, password=_get_db_pass(),
         cursor_factory=psycopg2.extras.RealDictCursor,
     )
 
 
-def fetch_all_candidates(conn) -> dict:
-    """Load all candidates grouped by linkedin_id for entity resolution."""
+BATCH_SIZE = 500
+FIELDS = """
+    uid, name, first_name, last_name, linkedin_id, linkedin_url,
+    current_title, current_company, city, state, country, location_raw,
+    about, certifications, verified_certifications, cert_verification_status,
+    cert_verification_sources, companies, industries,
+    experience, experience_text, experience_years, education,
+    skills, email, phone, source, is_internal,
+    sn_portal_verified, sn_portal_certs, added_at, updated_at
+"""
+
+def fetch_duplicate_lids(conn):
+    """Return linkedin_ids that have more than one candidate row."""
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT uid, name, first_name, last_name, linkedin_id, linkedin_url,
-                   current_title, current_company, city, state, country, location_raw,
-                   about, certifications, verified_certifications, cert_verification_status,
-                   cert_verification_sources, companies, industries,
-                   experience, experience_text, experience_years, education,
-                   skills, email, phone, source, is_internal,
-                   signalhire_enriched, signalhire_data,
-                   sn_portal_verified, sn_portal_certs,
-                   added_at, updated_at
-            FROM candidates
-            ORDER BY
-                CASE source
-                    WHEN 'credly'     THEN 1
-                    WHEN 'signalhire' THEN 2
-                    WHEN 'brightdata' THEN 3
-                    ELSE 4
-                END
+            SELECT linkedin_id FROM candidates
+            WHERE linkedin_id IS NOT NULL AND linkedin_id != ''
+            GROUP BY linkedin_id HAVING COUNT(*) > 1
         """)
-        rows = cur.fetchall()
+        return [r["linkedin_id"] for r in cur.fetchall()]
 
-    # Group by linkedin_id
-    by_lid   = {}  # linkedin_id → list of rows
-    no_lid   = []  # rows without linkedin_id
 
-    for row in rows:
-        lid = (row["linkedin_id"] or "").strip().lower()
-        if lid:
-            by_lid.setdefault(lid, []).append(row)
-        else:
-            no_lid.append(row)
-
-    return by_lid, no_lid
+def fetch_group(conn, lid):
+    """Fetch all rows for a single linkedin_id, sorted by source priority."""
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT {FIELDS} FROM candidates
+            WHERE linkedin_id = %s
+            ORDER BY CASE source
+                WHEN 'credly'     THEN 1
+                WHEN 'signalhire' THEN 2
+                WHEN 'brightdata' THEN 3
+                ELSE 4
+            END
+        """, (lid,))
+        return cur.fetchall()
 
 
 def merge_candidate_group(rows: list) -> dict:
@@ -237,52 +247,36 @@ def mark_duplicate(conn, duplicate_uid: str, canonical_uid: str):
 
 
 def run():
-    logger.info("=== gold-merge job started ===")
+    print("=== gold-merge job started ===", flush=True)
     conn = db_conn()
 
-    by_lid, no_lid = fetch_all_candidates(conn)
-    logger.info("Unique linkedin_ids: %d | No linkedin_id: %d",
-                len(by_lid), len(no_lid))
+    dup_lids = fetch_duplicate_lids(conn)
+    print(f"Duplicate linkedin_id groups: {len(dup_lids)}", flush=True)
 
-    merged_count = deduped_count = 0
+    merged_count = deduped_count = errors = 0
 
-    for lid, rows in by_lid.items():
+    for i, lid in enumerate(dup_lids):
         try:
-            if len(rows) > 1:
-                # Multiple sources for same person — merge
-                merged = merge_candidate_group(rows)
-                # Canonical = first row (highest priority source)
-                canonical_uid = rows[0]["uid"]
-                upsert_gold(conn, {**merged, "uid": canonical_uid})
-                # Mark duplicates
-                for dup_row in rows[1:]:
-                    if dup_row["uid"] != canonical_uid:
-                        mark_duplicate(conn, dup_row["uid"], canonical_uid)
-                        deduped_count += 1
-                merged_count += 1
-            else:
-                # Single source — just ensure verified_certifications is set
-                row    = rows[0]
-                merged = merge_candidate_group([row])
-                upsert_gold(conn, merged)
-                merged_count += 1
+            rows = fetch_group(conn, lid)
+            if len(rows) < 2:
+                continue
+            merged = merge_candidate_group(rows)
+            canonical_uid = rows[0]["uid"]
+            upsert_gold(conn, {**merged, "uid": canonical_uid})
+            for dup_row in rows[1:]:
+                if dup_row["uid"] != canonical_uid:
+                    mark_duplicate(conn, dup_row["uid"], canonical_uid)
+                    deduped_count += 1
+            merged_count += 1
         except Exception as e:
-            logger.error("Error merging lid=%s: %s", lid, e)
+            errors += 1
+            print(f"Error merging lid={lid}: {e}", flush=True)
+
+        if (i + 1) % BATCH_SIZE == 0:
+            conn.commit()
+            print(f"  [{i+1}/{len(dup_lids)}] merged={merged_count} dupes={deduped_count}", flush=True)
 
     conn.commit()
     conn.close()
 
-    logger.info("=== gold-merge done ===")
-    logger.info("  Merged/updated : %d", merged_count)
-    logger.info("  Duplicates     : %d", deduped_count)
-    logger.info("")
-    logger.info("AIR query — verified cert holders only:")
-    logger.info("  SELECT name, current_title, state, verified_certifications")
-    logger.info("  FROM candidates")
-    logger.info("  WHERE verified_certifications @> ARRAY['cis-csm']")
-    logger.info("    AND cert_verification_status = 'verified'")
-    logger.info("    AND state = 'texas';")
-
-
-if __name__ == "__main__":
-    run()
+    print(f"=== gold-merge done | merged={merged_count} duplicates={deduped_count} errors={errors} ===", flush=True)

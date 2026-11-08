@@ -368,6 +368,163 @@ resource "aws_scheduler_schedule" "brightdata_weekly" {
 
 # ── CloudWatch alarm — BrightData pipeline failure ────────────────────────────
 
+# ── SNS topic + email notification ───────────────────────────────────────────
+
+resource "aws_sns_topic" "pipeline_notify" {
+  name = "prajnov-talent-lake-pipeline-notify"
+
+  tags = {
+    project = "prajnov-talent-lake"
+  }
+}
+
+resource "aws_sns_topic_subscription" "email" {
+  topic_arn = aws_sns_topic.pipeline_notify.arn
+  protocol  = "email"
+  endpoint  = "navin@prajnov.com"
+}
+
+# ── IAM: allow EventBridge to publish to SNS ──────────────────────────────────
+
+resource "aws_sns_topic_policy" "pipeline_notify" {
+  arn = aws_sns_topic.pipeline_notify.arn
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "AllowEventBridge"
+      Effect    = "Allow"
+      Principal = { Service = "events.amazonaws.com" }
+      Action    = "sns:Publish"
+      Resource  = aws_sns_topic.pipeline_notify.arn
+    }]
+  })
+}
+
+# ── EventBridge rules — Credly pipeline SUCCEEDED + FAILED ───────────────────
+
+resource "aws_cloudwatch_event_rule" "credly_pipeline_succeeded" {
+  name        = "prajnov-credly-pipeline-succeeded"
+  description = "Fires when Credly talent lake pipeline completes successfully"
+
+  event_pattern = jsonencode({
+    source      = ["aws.states"]
+    detail-type = ["Step Functions Execution Status Change"]
+    detail = {
+      stateMachineArn = [aws_sfn_state_machine.pipeline.arn]
+      status          = ["SUCCEEDED"]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "credly_pipeline_succeeded" {
+  rule      = aws_cloudwatch_event_rule.credly_pipeline_succeeded.name
+  target_id = "credly-pipeline-succeeded-sns"
+  arn       = aws_sns_topic.pipeline_notify.arn
+
+  input_transformer {
+    input_paths = {
+      execution = "$.detail.executionArn"
+      started   = "$.detail.startDate"
+      stopped   = "$.detail.stopDate"
+    }
+    input_template = "\"Credly Pipeline — SUCCEEDED\\nExecution: <execution>\\nStarted:   <started>\\nCompleted: <stopped>\""
+  }
+}
+
+resource "aws_cloudwatch_event_rule" "credly_pipeline_failed" {
+  name        = "prajnov-credly-pipeline-failed"
+  description = "Fires when Credly talent lake pipeline fails"
+
+  event_pattern = jsonencode({
+    source      = ["aws.states"]
+    detail-type = ["Step Functions Execution Status Change"]
+    detail = {
+      stateMachineArn = [aws_sfn_state_machine.pipeline.arn]
+      status          = ["FAILED", "TIMED_OUT", "ABORTED"]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "credly_pipeline_failed" {
+  rule      = aws_cloudwatch_event_rule.credly_pipeline_failed.name
+  target_id = "credly-pipeline-failed-sns"
+  arn       = aws_sns_topic.pipeline_notify.arn
+
+  input_transformer {
+    input_paths = {
+      execution = "$.detail.executionArn"
+      status    = "$.detail.status"
+      cause     = "$.detail.cause"
+      started   = "$.detail.startDate"
+    }
+    input_template = "\"Credly Pipeline — FAILED (<status>)\\nExecution: <execution>\\nStarted:   <started>\\nCause:     <cause>\""
+  }
+}
+
+# ── EventBridge rules — BrightData pipeline SUCCEEDED + FAILED ───────────────
+
+resource "aws_cloudwatch_event_rule" "brightdata_pipeline_succeeded" {
+  name        = "prajnov-brightdata-pipeline-succeeded"
+  description = "Fires when BrightData pipeline completes successfully"
+
+  event_pattern = jsonencode({
+    source      = ["aws.states"]
+    detail-type = ["Step Functions Execution Status Change"]
+    detail = {
+      stateMachineArn = [aws_sfn_state_machine.brightdata_pipeline.arn]
+      status          = ["SUCCEEDED"]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "brightdata_pipeline_succeeded" {
+  rule      = aws_cloudwatch_event_rule.brightdata_pipeline_succeeded.name
+  target_id = "brightdata-pipeline-succeeded-sns"
+  arn       = aws_sns_topic.pipeline_notify.arn
+
+  input_transformer {
+    input_paths = {
+      execution = "$.detail.executionArn"
+      started   = "$.detail.startDate"
+      stopped   = "$.detail.stopDate"
+    }
+    input_template = "\"BrightData Pipeline — SUCCEEDED\\nExecution: <execution>\\nStarted:   <started>\\nCompleted: <stopped>\""
+  }
+}
+
+resource "aws_cloudwatch_event_rule" "brightdata_pipeline_failed" {
+  name        = "prajnov-brightdata-pipeline-failed"
+  description = "Fires when BrightData pipeline fails"
+
+  event_pattern = jsonencode({
+    source      = ["aws.states"]
+    detail-type = ["Step Functions Execution Status Change"]
+    detail = {
+      stateMachineArn = [aws_sfn_state_machine.brightdata_pipeline.arn]
+      status          = ["FAILED", "TIMED_OUT", "ABORTED"]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "brightdata_pipeline_failed" {
+  rule      = aws_cloudwatch_event_rule.brightdata_pipeline_failed.name
+  target_id = "brightdata-pipeline-failed-sns"
+  arn       = aws_sns_topic.pipeline_notify.arn
+
+  input_transformer {
+    input_paths = {
+      execution = "$.detail.executionArn"
+      status    = "$.detail.status"
+      cause     = "$.detail.cause"
+      started   = "$.detail.startDate"
+    }
+    input_template = "\"BrightData Pipeline — FAILED (<status>)\\nExecution: <execution>\\nStarted:   <started>\\nCause:     <cause>\""
+  }
+}
+
+# ── CloudWatch alarms ─────────────────────────────────────────────────────────
+
 resource "aws_cloudwatch_metric_alarm" "brightdata_pipeline_failure" {
   alarm_name          = "prajnov-brightdata-pipeline-failure"
   comparison_operator = "GreaterThanThreshold"

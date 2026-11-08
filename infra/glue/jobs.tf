@@ -7,9 +7,9 @@ locals {
     "--PGVECTOR_HOST"             = var.pgvector_host
     "--PGVECTOR_DB"               = var.pgvector_db
     "--PGVECTOR_USER"             = var.pgvector_user
-    "--PGVECTOR_PASSWORD"         = var.pgvector_password
+    "--PGVECTOR_SECRET_ARN"       = var.pgvector_secret_arn
     "--extra-py-files"            = "s3://${var.bucket}/glue-scripts/common.py"
-    "--additional-python-modules" = "requests,psycopg2-binary,boto3"
+    "--additional-python-modules" = "requests,psycopg2-binary,boto3>=1.34.0"
     "--job-language"              = "python"
     "--TempDir"                   = "s3://${var.bucket}/glue-tmp/"
     "--enable-job-insights"       = "true"
@@ -17,7 +17,7 @@ locals {
 
   brightdata_args = merge(local.common_args, {
     "--BRIGHTDATA_BUCKET"         = var.brightdata_bucket
-    "--additional-python-modules" = "psycopg2-binary,boto3,pyarrow,ijson"
+    "--additional-python-modules" = "psycopg2-binary,boto3>=1.34.0,pyarrow,ijson"
   })
 }
 
@@ -68,7 +68,7 @@ resource "aws_glue_job" "credly_silver_enrich" {
   default_arguments = local.common_args
 
   max_capacity = 0.0625
-  timeout      = 60
+  timeout      = 120
 
   tags = {
     project = "prajnov-talent-lake"
@@ -94,7 +94,7 @@ resource "aws_glue_job" "shared_dq_fix" {
   default_arguments = local.common_args
 
   max_capacity = 0.0625
-  timeout      = 60
+  timeout      = 120
 
   tags = {
     project = "prajnov-talent-lake"
@@ -227,7 +227,7 @@ resource "aws_glue_job" "brightdata_gold_upsert" {
   default_arguments = local.brightdata_args
 
   max_capacity = 1.0
-  timeout      = 60
+  timeout      = 120
 
   tags = {
     project = "prajnov-talent-lake"

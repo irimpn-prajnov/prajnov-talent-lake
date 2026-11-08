@@ -16,7 +16,10 @@ Schedule: Weekly (Sunday 05:00 UTC) — runs after gold-merge
 import json, logging, os, re, sys
 from datetime import datetime, timezone
 
-import boto3, psycopg2, psycopg2.extras
+import boto3
+import psycopg2
+import psycopg2.extras
+from botocore.exceptions import ClientError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -34,7 +37,16 @@ REGION  = _arg("AWS_REGION",        "ap-south-1")
 DB_HOST = _arg("PGVECTOR_HOST",     "ai-recruiter.c7q8sg00wqte.ap-south-1.rds.amazonaws.com")
 DB_NAME = _arg("PGVECTOR_DB",       "recruiter")
 DB_USER = _arg("PGVECTOR_USER",     "prajnov")
-DB_PASS = _arg("PGVECTOR_PASSWORD", "")
+SECRET_ARN = _arg("PGVECTOR_SECRET_ARN", "arn:aws:secretsmanager:ap-south-1:201727487159:secret:prajnov/recruiter-F8sc3X")
+
+def _get_db_pass() -> str:
+    env_pass = os.getenv("PGVECTOR_PASSWORD", "")
+    if env_pass:
+        return env_pass
+    client = boto3.client("secretsmanager", region_name=REGION)
+    secret = json.loads(client.get_secret_value(SecretId=SECRET_ARN)["SecretString"])
+    return secret.get("PGVECTOR_PASSWORD", "")
+
 
 # Canonical cert codes — anything not in this set is dirty
 CANONICAL_CERTS = {
@@ -124,7 +136,7 @@ def s3():
 
 def db():
     return psycopg2.connect(
-        host=DB_HOST, dbname=DB_NAME, user=DB_USER, password=DB_PASS,
+        host=DB_HOST, dbname=DB_NAME, user=DB_USER, password=_get_db_pass(),
         cursor_factory=psycopg2.extras.RealDictCursor,
     )
 
@@ -144,47 +156,49 @@ def fix_dirty_certs(conn) -> dict:
         """)
         rows = cur.fetchall()
 
+    updates = []
     for row in rows:
-        uid = row["uid"]
-        raw_certs  = row["certifications"] or []
-        ver_certs  = row["verified_certifications"] or []
+        uid       = row["uid"]
+        raw_certs = row["certifications"] or []
+        ver_certs = row["verified_certifications"] or []
 
-        # Normalize raw certifications[]
         new_raw = list({c for r in raw_certs for c in [clean_cert(r)] if c})
-
-        # Clean verified_certifications[] — remove micro/suite certs, normalize dirty codes
         new_ver = []
         for c in ver_certs:
             cleaned = clean_cert(c)
             if cleaned and cleaned in CANONICAL_CERTS:
                 if cleaned not in new_ver:
                     new_ver.append(cleaned)
-            elif cleaned:
-                # Normalized but not in canonical set — keep in raw, not verified
-                if cleaned not in new_raw:
-                    new_raw.append(cleaned)
-            # else: None = remove entirely
+            elif cleaned and cleaned not in new_raw:
+                new_raw.append(cleaned)
 
-        removed = len(ver_certs) - len(new_ver)
         if new_raw != raw_certs or new_ver != ver_certs:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE candidates SET
-                        certifications          = %s::text[],
-                        verified_certifications = %s::text[],
-                        cert_verification_status = CASE
-                            WHEN cardinality(%s::text[]) > 0 THEN 'verified'
-                            WHEN cert_verification_status = 'verified' AND cardinality(%s::text[]) = 0
-                            THEN 'checked_not_found'
-                            ELSE cert_verification_status
-                        END,
-                        updated_at = now()
-                    WHERE uid = %s
-                """, (new_raw, new_ver, new_ver, new_ver, uid))
+            updates.append((new_raw, new_ver, uid))
             stats["updated"] += 1
-            stats["certs_removed"] += removed
+            stats["certs_removed"] += len(ver_certs) - len(new_ver)
 
-    conn.commit()
+    if updates:
+        with conn.cursor() as cur:
+            cur.execute("CREATE TEMP TABLE _cert_updates (uid text, new_raw text[], new_ver text[]) ON COMMIT DROP")
+            psycopg2.extras.execute_values(
+                cur,
+                "INSERT INTO _cert_updates VALUES %s",
+                [(uid, raw, ver) for raw, ver, uid in updates]
+            )
+            cur.execute("""
+                UPDATE candidates c SET
+                    certifications          = u.new_raw,
+                    verified_certifications = u.new_ver,
+                    cert_verification_status = CASE
+                        WHEN cardinality(u.new_ver) > 0 THEN 'verified'
+                        WHEN c.cert_verification_status = 'verified' AND cardinality(u.new_ver) = 0
+                        THEN 'checked_not_found'
+                        ELSE c.cert_verification_status
+                    END,
+                    updated_at = now()
+                FROM _cert_updates u WHERE c.uid = u.uid
+            """)
+        conn.commit()
     logger.info("  Updated: %d | Certs removed/normalized: %d",
                 stats["updated"], stats["certs_removed"])
     return stats
@@ -197,78 +211,98 @@ def fix_duplicates(conn) -> dict:
     stats = {"merged": 0, "removed": 0}
 
     with conn.cursor() as cur:
+        # Count duplicate groups first
         cur.execute("""
-            SELECT linkedin_id, array_agg(uid ORDER BY
-                CASE source
-                    WHEN 'credly'     THEN 1
-                    WHEN 'signalhire' THEN 2
-                    WHEN 'brightdata' THEN 3
-                    ELSE 4
-                END, added_at
-            ) AS uids
-            FROM candidates
-            WHERE linkedin_id != '' AND linkedin_id IS NOT NULL
-            GROUP BY linkedin_id
-            HAVING COUNT(*) > 1
+            SELECT COUNT(*) AS cnt FROM (
+                SELECT linkedin_id FROM candidates
+                WHERE linkedin_id != '' AND linkedin_id IS NOT NULL
+                GROUP BY linkedin_id HAVING COUNT(*) > 1
+            ) t
         """)
-        dups = cur.fetchall()
+        stats["merged"] = cur.fetchone()["cnt"]
 
-    logger.info("  Duplicate linkedin_ids: %d", len(dups))
+    logger.info("  Duplicate linkedin_ids: %d", stats["merged"])
+    if not stats["merged"]:
+        return stats
 
-    for dup in dups:
-        uids      = dup["uids"]
-        canonical = uids[0]   # highest priority source
-        dupes     = uids[1:]
+    with conn.cursor() as cur:
+        # Single SQL pass: merge certs/skills/about into canonical, flag dupes
+        cur.execute("""
+            WITH ranked AS (
+                SELECT uid, linkedin_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY linkedin_id ORDER BY
+                        CASE source
+                            WHEN 'credly'     THEN 1
+                            WHEN 'signalhire' THEN 2
+                            WHEN 'brightdata' THEN 3
+                            ELSE 4
+                        END, added_at
+                    ) AS rn
+                FROM candidates
+                WHERE linkedin_id != '' AND linkedin_id IS NOT NULL
+            ),
+            canonical AS (SELECT uid, linkedin_id FROM ranked WHERE rn = 1),
+            merged AS (
+                SELECT
+                    c.uid,
+                    (
+                        SELECT array_agg(DISTINCT v ORDER BY v)
+                        FROM candidates d
+                        JOIN ranked r ON r.uid = d.uid AND r.linkedin_id = c.linkedin_id
+                        CROSS JOIN unnest(COALESCE(d.verified_certifications, ARRAY[]::text[])) v
+                    ) AS merged_ver,
+                    (
+                        SELECT array_agg(DISTINCT v ORDER BY v)
+                        FROM candidates d
+                        JOIN ranked r ON r.uid = d.uid AND r.linkedin_id = c.linkedin_id
+                        CROSS JOIN unnest(COALESCE(d.certifications, ARRAY[]::text[])) v
+                    ) AS merged_raw,
+                    (
+                        SELECT array_agg(DISTINCT v ORDER BY v)
+                        FROM candidates d
+                        JOIN ranked r ON r.uid = d.uid AND r.linkedin_id = c.linkedin_id
+                        CROSS JOIN unnest(COALESCE(d.skills, ARRAY[]::text[])) v
+                    ) AS merged_skills,
+                    (
+                        SELECT about FROM candidates d
+                        JOIN ranked r ON r.uid = d.uid AND r.linkedin_id = c.linkedin_id
+                        WHERE length(d.about) > 0
+                        ORDER BY length(d.about) DESC LIMIT 1
+                    ) AS best_about
+                FROM canonical c
+            )
+            UPDATE candidates SET
+                verified_certifications = m.merged_ver,
+                certifications          = m.merged_raw,
+                skills                  = m.merged_skills,
+                about                   = COALESCE(m.best_about, candidates.about),
+                updated_at              = now()
+            FROM merged m WHERE candidates.uid = m.uid
+        """)
 
-        # Merge verified_certifications from all dupes into canonical
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE candidates SET
-                    verified_certifications = (
-                        SELECT array_agg(DISTINCT v)
-                        FROM (
-                            SELECT unnest(c.verified_certifications) AS v
-                            FROM candidates c
-                            WHERE c.uid = ANY(%s)
-                              AND array_length(c.verified_certifications,1) > 0
-                        ) t
-                    ),
-                    certifications = (
-                        SELECT array_agg(DISTINCT v)
-                        FROM (
-                            SELECT unnest(c.certifications) AS v
-                            FROM candidates c WHERE c.uid = ANY(%s)
-                        ) t
-                    ),
-                    skills = (
-                        SELECT array_agg(DISTINCT v)
-                        FROM (
-                            SELECT unnest(c.skills) AS v
-                            FROM candidates c WHERE c.uid = ANY(%s)
-                              AND array_length(c.skills,1) > 0
-                        ) t
-                    ),
-                    about = (
-                        SELECT about FROM candidates
-                        WHERE uid = ANY(%s) AND length(about) > 0
-                        ORDER BY length(about) DESC LIMIT 1
-                    ),
-                    updated_at = now()
-                WHERE uid = %s
-            """, (uids, uids, uids, uids, canonical))
-
-            # Mark duplicates
-            cur.execute("""
-                UPDATE candidates SET
-                    source     = source || '+duplicate',
-                    updated_at = now()
-                WHERE uid = ANY(%s)
-            """, (dupes,))
-
-        conn.commit()
-        stats["merged"] += 1
-        stats["removed"] += len(dupes)
-
+        # Flag non-canonical dupes
+        cur.execute("""
+            WITH ranked AS (
+                SELECT uid,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY linkedin_id ORDER BY
+                        CASE source
+                            WHEN 'credly'     THEN 1
+                            WHEN 'signalhire' THEN 2
+                            WHEN 'brightdata' THEN 3
+                            ELSE 4
+                        END, added_at
+                    ) AS rn
+                FROM candidates
+                WHERE linkedin_id != '' AND linkedin_id IS NOT NULL
+            )
+            UPDATE candidates SET source = source || '+duplicate', updated_at = now()
+            FROM ranked WHERE candidates.uid = ranked.uid AND ranked.rn > 1
+                          AND candidates.source NOT LIKE '%%duplicate%%'
+        """)
+        stats["removed"] = cur.rowcount
+    conn.commit()
     logger.info("  Merged: %d groups | Flagged duplicates: %d", stats["merged"], stats["removed"])
     return stats
 
@@ -291,32 +325,30 @@ def fix_experience_years(conn) -> dict:
 
     current_year = datetime.now().year
 
+    updates = []
     for row in rows:
         exp = row["experience"] if isinstance(row["experience"], list) else []
-        if not exp:
-            continue
-
-        # Find earliest start year across all roles
-        years = []
-        for e in exp:
-            sy = e.get("start_year") if isinstance(e, dict) else None
-            if sy and isinstance(sy, int) and 1970 < sy <= current_year:
-                years.append(sy)
-
+        years = [
+            e["start_year"] for e in exp
+            if isinstance(e, dict) and isinstance(e.get("start_year"), int)
+            and 1970 < e["start_year"] <= current_year
+        ]
         if not years:
             continue
+        calc_years = max(1, min(current_year - min(years), 40))
+        updates.append((calc_years, row["uid"]))
 
-        calc_years = current_year - min(years)
-        calc_years = max(1, min(calc_years, 40))  # sanity bounds
-
+    if updates:
         with conn.cursor() as cur:
+            cur.execute("CREATE TEMP TABLE _exp_updates (uid text, yrs int) ON COMMIT DROP")
+            psycopg2.extras.execute_values(cur, "INSERT INTO _exp_updates VALUES %s",
+                                           [(uid, y) for y, uid in updates])
             cur.execute("""
-                UPDATE candidates SET experience_years = %s, updated_at = now()
-                WHERE uid = %s
-            """, (calc_years, row["uid"]))
-        stats["updated"] += 1
-
-    conn.commit()
+                UPDATE candidates c SET experience_years = u.yrs, updated_at = now()
+                FROM _exp_updates u WHERE c.uid = u.uid
+            """)
+        conn.commit()
+        stats["updated"] = len(updates)
     logger.info("  Updated experience_years: %d", stats["updated"])
     return stats
 
@@ -366,31 +398,38 @@ def fix_locations(conn) -> dict:
         """)
         rows = cur.fetchall()
 
+    location_updates = []
     for row in rows:
-        raw    = row["location_raw"] or ""
-        parts  = [p.strip().lower() for p in raw.split(",")]
-        state  = ""
-        city   = ""
-
+        raw   = row["location_raw"] or ""
+        parts = [p.strip().lower() for p in raw.split(",")]
+        state = ""
+        city  = ""
         for part in parts:
             if part in US_STATE_MAP:
                 state = US_STATE_MAP[part]
             elif not city and part and "united states" not in part:
                 city = part
-
         if state:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE candidates SET
-                        city  = CASE WHEN city = '' AND %s != '' THEN %s ELSE city END,
-                        state = %s,
-                        country = 'US',
-                        updated_at = now()
-                    WHERE uid = %s
-                """, (city, city, state, row["uid"]))
+            location_updates.append((city, state, row["uid"]))
             stats["updated"] += 1
 
-    conn.commit()
+    if location_updates:
+        with conn.cursor() as cur:
+            cur.execute("CREATE TEMP TABLE _loc_updates (uid text, new_city text, new_state text) ON COMMIT DROP")
+            psycopg2.extras.execute_values(
+                cur,
+                "INSERT INTO _loc_updates VALUES %s",
+                [(uid, city, state) for city, state, uid in location_updates]
+            )
+            cur.execute("""
+                UPDATE candidates c SET
+                    city    = CASE WHEN c.city = '' AND u.new_city != '' THEN u.new_city ELSE c.city END,
+                    state   = u.new_state,
+                    country = 'US',
+                    updated_at = now()
+                FROM _loc_updates u WHERE c.uid = u.uid
+            """)
+        conn.commit()
     logger.info("  Locations fixed: %d", stats["updated"])
     return stats
 
@@ -448,5 +487,4 @@ def run():
     logger.info("=== data-quality-fix done ===")
 
 
-if __name__ == "__main__":
-    run()
+run()

@@ -192,14 +192,30 @@ import re as _re
 PGVECTOR_HOST = _os.getenv("PGVECTOR_HOST", "ai-recruiter.c7q8sg00wqte.ap-south-1.rds.amazonaws.com")
 PGVECTOR_DB   = _os.getenv("PGVECTOR_DB",   "recruiter")
 PGVECTOR_USER = _os.getenv("PGVECTOR_USER",  "prajnov")
-PGVECTOR_PASS = _os.getenv("PGVECTOR_PASSWORD", "")
+
+SECRETS_MANAGER_SECRET = _os.getenv("PGVECTOR_SECRET_ARN", "prajnov/recruiter")
+
+
+def _get_pgvector_password() -> str:
+    """Return PGVECTOR_PASSWORD — env var first, then Secrets Manager."""
+    pw = _os.getenv("PGVECTOR_PASSWORD", "")
+    if pw:
+        return pw
+    try:
+        import json as _json
+        secret = boto3.client("secretsmanager", region_name="ap-south-1").get_secret_value(
+            SecretId=SECRETS_MANAGER_SECRET
+        )
+        return _json.loads(secret["SecretString"])["PGVECTOR_PASSWORD"]
+    except Exception as e:
+        raise RuntimeError(f"Could not retrieve PGVECTOR_PASSWORD from Secrets Manager: {e}")
 
 
 def get_db():
     import psycopg2, psycopg2.extras
     return psycopg2.connect(
         host=PGVECTOR_HOST, dbname=PGVECTOR_DB,
-        user=PGVECTOR_USER, password=PGVECTOR_PASS,
+        user=PGVECTOR_USER, password=_get_pgvector_password(),
         cursor_factory=psycopg2.extras.RealDictCursor,
     )
 
@@ -276,6 +292,9 @@ CERT_NORM = {
     "cis-sm": "cis-sm", "service mapping": "cis-sm",
     "cis-tprm": "cis-tprm", "cis-fso": "cis-fso",
     "cis-pa": "cis-pa", "platform analytics": "cis-pa",
+    "cis-lsd": "cis-lsd", "legal service delivery": "cis-lsd",
+    "cis-df": "cis-df", "data foundations": "cis-df",
+    "cta": "cta", "certified technical architect": "cta",
     "itil": "itil", "pmp": "pmp", "cissp": "cissp",
     "safe": "safe", "six sigma": "six-sigma", "six-sigma": "six-sigma",
     "aws certified solutions architect": "aws-sa",

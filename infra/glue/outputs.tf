@@ -22,3 +22,8 @@ output "glue_role_arn" {
 output "pipeline_stages" {
   value = "Bronze (Credly scrape) → Silver (enrich candidates) → DQ Fix → Gold (merge)"
 }
+
+output "pipeline_notify_topic_arn" {
+  value       = aws_sns_topic.pipeline_notify.arn
+  description = "SNS topic for pipeline success/failure emails — confirm subscription in inbox after apply"
+}

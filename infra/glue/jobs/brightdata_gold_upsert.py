@@ -25,7 +25,10 @@ import io, json, logging, os, re, sys
 from collections import defaultdict
 from datetime import datetime, timezone
 
-import boto3, psycopg2, psycopg2.extras
+import boto3
+from botocore.exceptions import ClientError
+import psycopg2
+import psycopg2.extras
 import pyarrow.parquet as pq
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -44,9 +47,18 @@ REGION   = _arg("AWS_REGION",        "ap-south-1")
 DB_HOST  = _arg("PGVECTOR_HOST",     "ai-recruiter.c7q8sg00wqte.ap-south-1.rds.amazonaws.com")
 DB_NAME  = _arg("PGVECTOR_DB",       "recruiter")
 DB_USER  = _arg("PGVECTOR_USER",     "prajnov")
-DB_PASS  = _arg("PGVECTOR_PASSWORD", "")
+SECRET_ARN = _arg("PGVECTOR_SECRET_ARN", "arn:aws:secretsmanager:ap-south-1:201727487159:secret:prajnov/recruiter-F8sc3X")
+
+def _get_db_pass() -> str:
+    env_pass = os.getenv("PGVECTOR_PASSWORD", "")
+    if env_pass:
+        return env_pass
+    client = boto3.client("secretsmanager", region_name=REGION)
+    secret = json.loads(client.get_secret_value(SecretId=SECRET_ARN)["SecretString"])
+    return secret.get("PGVECTOR_PASSWORD", "")
+
 STATE_KEY = "glue-state/brightdata_gold_upsert/last_run.json"
-COMMIT_EVERY = 500
+BATCH_SIZE = 2000
 
 
 def s3():
@@ -55,7 +67,7 @@ def s3():
 
 def db():
     return psycopg2.connect(
-        host=DB_HOST, dbname=DB_NAME, user=DB_USER, password=DB_PASS,
+        host=DB_HOST, dbname=DB_NAME, user=DB_USER, password=_get_db_pass(),
         cursor_factory=psycopg2.extras.RealDictCursor,
     )
 
@@ -121,96 +133,96 @@ def jlist(val) -> list:
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
-def load_existing_linkedin_ids(conn) -> set:
-    with conn.cursor() as cur:
-        cur.execute("SELECT linkedin_id FROM candidates WHERE linkedin_id IS NOT NULL AND linkedin_id != ''")
-        return {row["linkedin_id"] for row in cur.fetchall()}
-
-
-def upsert_candidate(conn, cand: dict, certs: list, skills: list,
-                     experience: list, education: list, is_new: bool):
-    lid = cand.get("linkedin_id", "")
-    uid = f"bd_{lid}" if lid else f"bd_{cand['candidate_id'][:16]}"
-
-    raw_certs   = jlist(cand.get("certifications_raw"))
+def build_row(cand: dict, certs_by, skills_by, exp_by, edu_by) -> tuple:
+    cid         = cand["candidate_id"]
+    lid         = cand.get("linkedin_id", "") or ""
+    uid         = f"bd_{lid}" if lid else f"bd_{cand['candidate_id'][:16]}"
+    experience  = exp_by.get(cid, [])
     clean_certs = jlist(cand.get("certifications_clean"))
-    skill_names = sorted({r["skill_name"] for r in skills})
+    skill_names = sorted({r["skill_name"] for r in skills_by.get(cid, [])})
     companies   = sorted({r["company"] for r in experience if r.get("company")})
     exp_text    = " | ".join(
         f"{e['title']} at {e['company']}" for e in experience[:10]
         if e.get("title") and e.get("company")
     )
+    return (
+        uid,
+        cand.get("name", ""), cand.get("first_name", ""), cand.get("last_name", ""),
+        lid, cand.get("linkedin_url", ""),
+        cand.get("current_title", ""), cand.get("current_company", ""),
+        cand.get("city", ""), cand.get("state", ""), cand.get("country", "US"),
+        cand.get("location_raw", ""),
+        cand.get("about", ""),
+        clean_certs,
+        skill_names, companies,
+        json.dumps(experience), exp_text,
+        cand.get("experience_years") or -1,
+        json.dumps(edu_by.get(cid, [])),
+        cand.get("email", ""), cand.get("phone", ""),
+    )
 
+
+UPSERT_SQL = """
+    INSERT INTO candidates (
+        uid, name, first_name, last_name,
+        linkedin_id, linkedin_url,
+        current_title, current_company,
+        city, state, country, location_raw,
+        about, certifications, verified_certifications,
+        cert_verification_status,
+        skills, companies,
+        experience, experience_text, experience_years,
+        education, email, phone,
+        source, is_internal,
+        added_at, updated_at
+    ) VALUES (
+        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+        ARRAY[]::text[], 'unverified',
+        %s,%s,%s,%s,%s,%s,%s,%s,
+        'brightdata', false,
+        now(), now()
+    )
+    ON CONFLICT (uid) DO UPDATE SET
+        current_title   = CASE WHEN EXCLUDED.current_title != ''
+                               THEN EXCLUDED.current_title
+                               ELSE candidates.current_title END,
+        current_company = CASE WHEN EXCLUDED.current_company != ''
+                               THEN EXCLUDED.current_company
+                               ELSE candidates.current_company END,
+        city  = CASE WHEN EXCLUDED.city != '' AND candidates.city = ''
+                     THEN EXCLUDED.city ELSE candidates.city END,
+        state = CASE WHEN EXCLUDED.state != '' AND candidates.state = ''
+                     THEN EXCLUDED.state ELSE candidates.state END,
+        country = CASE WHEN EXCLUDED.country != '' AND candidates.country = ''
+                       THEN EXCLUDED.country ELSE candidates.country END,
+        about = CASE WHEN length(EXCLUDED.about) > length(COALESCE(candidates.about,''))
+                     THEN EXCLUDED.about ELSE candidates.about END,
+        certifications  = EXCLUDED.certifications,
+        skills = CASE
+            WHEN cardinality(EXCLUDED.skills) > cardinality(COALESCE(candidates.skills, ARRAY[]::text[]))
+            THEN EXCLUDED.skills ELSE candidates.skills END,
+        companies       = EXCLUDED.companies,
+        experience      = EXCLUDED.experience,
+        experience_text = EXCLUDED.experience_text,
+        experience_years = CASE WHEN EXCLUDED.experience_years > 0
+                                THEN EXCLUDED.experience_years
+                                ELSE candidates.experience_years END,
+        education       = EXCLUDED.education,
+        email = CASE WHEN EXCLUDED.email != '' AND candidates.email = ''
+                     THEN EXCLUDED.email ELSE candidates.email END,
+        phone = CASE WHEN EXCLUDED.phone != '' AND candidates.phone = ''
+                     THEN EXCLUDED.phone ELSE candidates.phone END,
+        source = CASE WHEN candidates.source NOT LIKE '%%brightdata%%'
+                      THEN candidates.source || '+brightdata'
+                      ELSE candidates.source END,
+        updated_at = now()
+"""
+
+
+def upsert_batch(conn, rows: list):
     with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO candidates (
-                uid, name, first_name, last_name,
-                linkedin_id, linkedin_url,
-                current_title, current_company,
-                city, state, country, location_raw,
-                about, certifications, verified_certifications,
-                cert_verification_status,
-                skills, companies,
-                experience, experience_text, experience_years,
-                education, email, phone,
-                source, is_internal,
-                added_at, updated_at
-            ) VALUES (
-                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                ARRAY[]::text[], 'unverified',
-                %s,%s,%s,%s,%s,%s,%s,%s,
-                'brightdata', false,
-                now(), now()
-            )
-            ON CONFLICT (uid) DO UPDATE SET
-                current_title   = CASE WHEN EXCLUDED.current_title != ''
-                                       THEN EXCLUDED.current_title
-                                       ELSE candidates.current_title END,
-                current_company = CASE WHEN EXCLUDED.current_company != ''
-                                       THEN EXCLUDED.current_company
-                                       ELSE candidates.current_company END,
-                city  = CASE WHEN EXCLUDED.city != '' AND candidates.city = ''
-                             THEN EXCLUDED.city ELSE candidates.city END,
-                state = CASE WHEN EXCLUDED.state != '' AND candidates.state = ''
-                             THEN EXCLUDED.state ELSE candidates.state END,
-                country = CASE WHEN EXCLUDED.country != '' AND candidates.country = ''
-                               THEN EXCLUDED.country ELSE candidates.country END,
-                about = CASE WHEN length(EXCLUDED.about) > length(COALESCE(candidates.about,''))
-                             THEN EXCLUDED.about ELSE candidates.about END,
-                certifications  = EXCLUDED.certifications,
-                skills = CASE
-                    WHEN cardinality(EXCLUDED.skills) > cardinality(COALESCE(candidates.skills, ARRAY[]::text[]))
-                    THEN EXCLUDED.skills ELSE candidates.skills END,
-                companies       = EXCLUDED.companies,
-                experience      = EXCLUDED.experience,
-                experience_text = EXCLUDED.experience_text,
-                experience_years = CASE WHEN EXCLUDED.experience_years > 0
-                                        THEN EXCLUDED.experience_years
-                                        ELSE candidates.experience_years END,
-                education       = EXCLUDED.education,
-                email = CASE WHEN EXCLUDED.email != '' AND candidates.email = ''
-                             THEN EXCLUDED.email ELSE candidates.email END,
-                phone = CASE WHEN EXCLUDED.phone != '' AND candidates.phone = ''
-                             THEN EXCLUDED.phone ELSE candidates.phone END,
-                source = CASE WHEN candidates.source NOT LIKE '%%brightdata%%'
-                              THEN candidates.source || '+brightdata'
-                              ELSE candidates.source END,
-                updated_at = now()
-        """, (
-            uid,
-            cand.get("name", ""), cand.get("first_name", ""), cand.get("last_name", ""),
-            lid, cand.get("linkedin_url", ""),
-            cand.get("current_title", ""), cand.get("current_company", ""),
-            cand.get("city", ""), cand.get("state", ""), cand.get("country", "US"),
-            cand.get("location_raw", ""),
-            cand.get("about", ""),
-            clean_certs,
-            skill_names, companies,
-            json.dumps(experience), exp_text,
-            cand.get("experience_years") or -1,
-            json.dumps(education),
-            cand.get("email", ""), cand.get("phone", ""),
-        ))
+        psycopg2.extras.execute_values(cur, UPSERT_SQL, rows, page_size=500)
+    conn.commit()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -251,54 +263,24 @@ def run():
         edu_by[r["candidate_id"]].append(r)
 
     conn = db()
-    logger.info("Loading existing linkedin_ids from DB...")
-    existing_lids = load_existing_linkedin_ids(conn)
-    logger.info("Existing candidates in DB: %d", len(existing_lids))
+    total = len(candidates)
+    processed = 0
 
-    stats = {"new": 0, "updated": 0, "errors": 0}
-
-    for i, cand in enumerate(candidates):
-        cid = cand["candidate_id"]
-        lid = cand.get("linkedin_id", "")
-        is_new = lid not in existing_lids
-
+    for batch_start in range(0, total, BATCH_SIZE):
+        batch = candidates[batch_start:batch_start + BATCH_SIZE]
+        rows = [build_row(c, certs_by, skills_by, exp_by, edu_by) for c in batch]
         try:
-            upsert_candidate(
-                conn, cand,
-                certs_by.get(cid, []),
-                skills_by.get(cid, []),
-                exp_by.get(cid, []),
-                edu_by.get(cid, []),
-                is_new,
-            )
-            if is_new:
-                stats["new"] += 1
-                if lid:
-                    existing_lids.add(lid)
-            else:
-                stats["updated"] += 1
+            upsert_batch(conn, rows)
         except Exception as e:
             conn.rollback()
-            stats["errors"] += 1
-            if stats["errors"] <= 5:
-                logger.warning("upsert error lid=%s: %s", lid, e)
+            logger.warning("batch error at %d: %s", batch_start, e)
             continue
+        processed += len(batch)
+        logger.info("  %d/%d upserted", processed, total)
 
-        if (i + 1) % COMMIT_EVERY == 0:
-            conn.commit()
-            logger.info("  %d/%d processed (new=%d updated=%d errors=%d)",
-                        i + 1, len(candidates), stats["new"], stats["updated"], stats["errors"])
-
-    conn.commit()
     conn.close()
     set_watermark(run_start)
-
-    logger.info("=== brightdata-gold-upsert done ===")
-    logger.info("  new=%d  updated=%d  errors=%d", stats["new"], stats["updated"], stats["errors"])
-    logger.info("  Silver classification:")
-    logger.info("    new candidates (not in DB)     : %d", stats["new"])
-    logger.info("    updated candidates (enriched)  : %d", stats["updated"])
-    logger.info("  Note: verified_certifications[] untouched — Credly owns that field")
+    logger.info("=== brightdata-gold-upsert done | processed=%d ===", processed)
 
 
 if __name__ == "__main__":

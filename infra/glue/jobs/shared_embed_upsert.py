@@ -19,7 +19,10 @@ Profile text assembled from (in order):
 import json, logging, os, sys
 from datetime import datetime, timezone
 
-import boto3, psycopg2, psycopg2.extras
+import boto3
+import psycopg2
+import psycopg2.extras
+from botocore.exceptions import ClientError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -39,17 +42,28 @@ REGION    = _arg("AWS_REGION",        "ap-south-1")
 DB_HOST   = _arg("PGVECTOR_HOST",     "ai-recruiter.c7q8sg00wqte.ap-south-1.rds.amazonaws.com")
 DB_NAME   = _arg("PGVECTOR_DB",       "recruiter")
 DB_USER   = _arg("PGVECTOR_USER",     "prajnov")
-DB_PASS   = _arg("PGVECTOR_PASSWORD", "")
+SECRET_ARN = _arg("PGVECTOR_SECRET_ARN", "arn:aws:secretsmanager:ap-south-1:201727487159:secret:prajnov/recruiter-F8sc3X")
+
+def _get_db_pass() -> str:
+    env_pass = os.getenv("PGVECTOR_PASSWORD", "")
+    if env_pass:
+        return env_pass
+    client = boto3.client("secretsmanager", region_name=REGION)
+    secret = json.loads(client.get_secret_value(SecretId=SECRET_ARN)["SecretString"])
+    return secret.get("PGVECTOR_PASSWORD", "")
+
 
 EMBED_MODEL  = "amazon.titan-embed-text-v2:0"
 EMBED_DIM    = 1024
 BATCH_SIZE   = 50
+MAX_ROWS     = 10000
+THREADS      = 20
 STATE_KEY    = "glue-state/shared_embed_upsert/last_run.json"
 
 
 def db():
     return psycopg2.connect(
-        host=DB_HOST, dbname=DB_NAME, user=DB_USER, password=DB_PASS,
+        host=DB_HOST, dbname=DB_NAME, user=DB_USER, password=_get_db_pass(),
         cursor_factory=psycopg2.extras.RealDictCursor,
     )
 
@@ -123,14 +137,31 @@ def embed(client, text):
     return json.loads(resp["body"].read())["embedding"]
 
 
+def embed_one(args):
+    """Each thread creates its own Bedrock client."""
+    import time
+    uid, text = args
+    if not text.strip():
+        return uid, None
+    client = boto3.client("bedrock-runtime", region_name=REGION)
+    for attempt in range(5):
+        try:
+            return uid, embed(client, text)
+        except Exception as e:
+            if "Throttling" in str(e) or "TooManyRequests" in str(e):
+                time.sleep(2 ** attempt)
+                continue
+            return uid, e
+    return uid, Exception("throttled after 5 retries")
+
+
 def run():
     run_start = datetime.now(timezone.utc).isoformat()
     watermark = get_watermark()
-    logger.info("=== shared-embed-upsert started | watermark=%s ===", watermark)
+    print(f"=== shared-embed-upsert started | watermark={watermark} ===", flush=True)
 
-    conn    = db()
-    bedrock_client = bedrock()
-    stats   = {"embedded": 0, "skipped": 0, "errors": 0}
+    conn  = db()
+    stats = {"embedded": 0, "skipped": 0, "errors": 0}
 
     with conn.cursor() as cur:
         cur.execute("""
@@ -138,44 +169,73 @@ def run():
                    city, state, experience_years,
                    verified_certifications, skills, about, experience_text
             FROM candidates
-            WHERE updated_at > %s
-            ORDER BY updated_at
-        """, (watermark,))
+            WHERE embedding_titan IS NULL
+            ORDER BY added_at
+            LIMIT %s
+        """, (MAX_ROWS,))
         rows = cur.fetchall()
 
-    logger.info("Candidates to embed: %d", len(rows))
+    print(f"Candidates to embed: {len(rows)} (cap={MAX_ROWS})", flush=True)
+    if not rows:
+        print("Nothing to embed. Done.", flush=True)
+        conn.close()
+        return
 
-    for i in range(0, len(rows), BATCH_SIZE):
-        batch = rows[i:i + BATCH_SIZE]
-        texts = [build_profile_text(dict(r)) for r in batch]
+    tasks = [(dict(r)["uid"], build_profile_text(dict(r))) for r in rows]
 
-        for r, text in zip(batch, texts):
-            if not text.strip():
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    batch_updates = []
+    completed = 0
+    with ThreadPoolExecutor(max_workers=THREADS) as pool:
+        futures = {pool.submit(embed_one, t): t[0] for t in tasks}
+        for future in as_completed(futures):
+            uid, result = future.result()
+            completed += 1
+            if result is None:
                 stats["skipped"] += 1
-                continue
-            try:
-                vec = embed(bedrock_client, text)
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE candidates SET embedding_titan = %s::vector, updated_at = now() WHERE uid = %s",
-                        (vec, r["uid"])
-                    )
-                stats["embedded"] += 1
-            except Exception as e:
+            elif isinstance(result, Exception):
                 stats["errors"] += 1
-                if stats["errors"] <= 5:
-                    logger.warning("embed error uid=%s: %s", r["uid"], e)
+                print(f"ERROR uid={uid}: {result}", flush=True)
+            else:
+                batch_updates.append((result, uid))
+                stats["embedded"] += 1
 
+            if completed % 100 == 0:
+                print(f"  progress={completed}/{len(tasks)} embedded={stats['embedded']} errors={stats['errors']}", flush=True)
+
+            if len(batch_updates) >= BATCH_SIZE:
+                with conn.cursor() as cur:
+                    psycopg2.extras.execute_values(
+                        cur,
+                        "UPDATE candidates SET embedding_titan = data.vec::vector, updated_at = now() FROM (VALUES %s) AS data(vec, uid) WHERE candidates.uid = data.uid",
+                        batch_updates, template="(%s::float4[], %s)"
+                    )
+                conn.commit()
+                print(f"  flushed | embedded={stats['embedded']}", flush=True)
+                batch_updates = []
+
+    # Flush remainder
+    if batch_updates:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(
+                cur,
+                "UPDATE candidates SET embedding_titan = data.vec::vector, updated_at = now() FROM (VALUES %s) AS data(vec, uid) WHERE candidates.uid = data.uid",
+                batch_updates, template="(%s::float4[], %s)"
+            )
         conn.commit()
-        logger.info("  [%d/%d] embedded=%d errors=%d",
-                    min(i + BATCH_SIZE, len(rows)), len(rows),
-                    stats["embedded"], stats["errors"])
 
     conn.close()
     set_watermark(run_start)
-    logger.info("=== shared-embed-upsert done | embedded=%d skipped=%d errors=%d ===",
-                stats["embedded"], stats["skipped"], stats["errors"])
+    print(f"=== shared-embed-upsert done | embedded={stats['embedded']} skipped={stats['skipped']} errors={stats['errors']} ===", flush=True)
+
+    # Refresh search materialized view so candidate search reflects new data
+    print("Refreshing candidates_search materialized view...", flush=True)
+    import psycopg2 as _pg2
+    ref_conn = _pg2.connect(host=DB_HOST, dbname=DB_NAME, user=DB_USER, password=_get_db_pass())
+    ref_conn.autocommit = True
+    ref_conn.cursor().execute("REFRESH MATERIALIZED VIEW CONCURRENTLY candidates_search")
+    ref_conn.close()
+    print("candidates_search refreshed", flush=True)
 
 
-if __name__ == "__main__":
-    run()
+run()

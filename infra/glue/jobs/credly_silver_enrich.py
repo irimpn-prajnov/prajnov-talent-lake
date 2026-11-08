@@ -16,8 +16,7 @@ import boto3, psycopg2, psycopg2.extras
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# Glue Python Shell passes --ARG_NAME via sys.argv, not os.environ.
-# Parse them out manually so the script works both locally and in Glue.
+
 def _arg(name, default=""):
     key = f"--{name}"
     try:
@@ -26,46 +25,80 @@ def _arg(name, default=""):
     except (ValueError, IndexError):
         return os.getenv(name, default)
 
-BUCKET   = _arg("BUCKET",            "prajnov-talent-lake")
-REGION   = _arg("AWS_REGION",        "ap-south-1")
-DB_HOST  = _arg("PGVECTOR_HOST",     "ai-recruiter.c7q8sg00wqte.ap-south-1.rds.amazonaws.com")
-DB_NAME  = _arg("PGVECTOR_DB",       "recruiter")
-DB_USER  = _arg("PGVECTOR_USER",     "prajnov")
-DB_PASS  = _arg("PGVECTOR_PASSWORD", "")
+
+BUCKET  = _arg("BUCKET",        "prajnov-talent-lake")
+DB_HOST = _arg("PGVECTOR_HOST", "ai-recruiter.c7q8sg00wqte.ap-south-1.rds.amazonaws.com")
+DB_NAME = _arg("PGVECTOR_DB",   "recruiter")
+DB_USER = _arg("PGVECTOR_USER", "prajnov")
 
 CREDLY_PREFIX = "bronze/discovery/credly/certs/"
 
-# All 19 cert slugs → canonical codes
 SLUG_TO_CODE = {
     "csa":          "csa",
     "cad":          "cad",
     "cta":          "cta",
     "cma":          "cma",
-    "cis_itsm":     "cis-itsm",
-    "cis_itom":     "cis-itom",
-    "cis_hrsd":     "cis-hrsd",
     "cis_csm":      "cis-csm",
-    "cis_fsm":      "cis-fsm",
-    "cis_sam":      "cis-sam",
-    "cis_ham":      "cis-ham",
-    "cis_itam":     "cis-itam",
-    "cis_spm":      "cis-spm",
-    "cis_ppm":      "cis-ppm",
-    "cis_rc":       "cis-rc",
-    "cis_sir":      "cis-sir",
-    "cis_vr":       "cis-vr",
+    "cis_df":       "cis-df",
     "cis_disco":    "cis-disco",
+    "cis_em":       "cis-em",
+    "cis_fsm":      "cis-fsm",
+    "cis_ham":      "cis-ham",
+    "cis_hr":       "cis-hr",
+    "cis_itsm":     "cis-itsm",
+    "cis_pa":       "cis-pa",
+    "cis_rc":       "cis-rc",
+    "cis_sam":      "cis-sam",
+    "cis_sir":      "cis-sir",
+    "cis_sm":       "cis-sm",
+    "cis_sp":       "cis-sp",
+    "cis_spm":      "cis-spm",
+    "cis_tprm":     "cis-tprm",
+    "cis_vr":       "cis-vr",
     "cis_apm":      "cis-apm",
+    "cis_cpg":      "cis-cpg",
+    "suite_csm":    "suite-csm",
+    "suite_df":     "suite-df",
+    "suite_ea":     "suite-ea",
+    "suite_hr":     "suite-hr",
+    "suite_itsm":   "suite-itsm",
+    "suite_itom_v": "suite-itom-v",
+    "suite_itom_p": "suite-itom-p",
+    "suite_itom_e": "suite-itom-e",
+    "suite_lsd":    "suite-lsd",
+    "suite_pi":     "suite-pi",
+    "suite_psds":   "suite-psds",
+    "suite_wsd":    "suite-wsd",
+    "suite_fso_b":  "suite-fso-b",
+    "suite_fso_i":  "suite-fso-i",
+    "suite_apo":    "suite-apo",
+    "suite_spo":    "suite-spo",
+    "suite_slo":    "suite-slo",
+    "suite_tsm":    "suite-tsm",
+    "cpoa":         "cpoa",
+    "cpop":         "cpop",
+    "cpoe":         "cpoe",
 }
 
 
+def _get_db_pass() -> str:
+    env_pass = os.getenv("PGVECTOR_PASSWORD", "")
+    if env_pass:
+        return env_pass
+    region     = _arg("AWS_REGION", "ap-south-1")
+    secret_arn = _arg("PGVECTOR_SECRET_ARN", "arn:aws:secretsmanager:ap-south-1:201727487159:secret:prajnov/recruiter-F8sc3X")
+    client = boto3.client("secretsmanager", region_name=region)
+    secret = json.loads(client.get_secret_value(SecretId=secret_arn)["SecretString"])
+    return secret.get("PGVECTOR_PASSWORD", "")
+
+
 def s3():
-    return boto3.client("s3", region_name=REGION)
+    return boto3.client("s3", region_name=_arg("AWS_REGION", "ap-south-1"))
 
 
 def db():
     return psycopg2.connect(
-        host=DB_HOST, dbname=DB_NAME, user=DB_USER, password=DB_PASS,
+        host=DB_HOST, dbname=DB_NAME, user=DB_USER, password=_get_db_pass(),
         cursor_factory=psycopg2.extras.RealDictCursor,
     )
 
@@ -129,10 +162,7 @@ def parse_location(raw: str):
     return city, state, country or ("US" if state else "")
 
 
-# ── Load consolidated bronze files ────────────────────────────────────────────
-
 def load_all_bronze() -> dict:
-    """Returns {slug: [records]} for all certs that have a consolidated file."""
     client = s3()
     result = {}
     for slug in SLUG_TO_CODE:
@@ -149,11 +179,8 @@ def load_all_bronze() -> dict:
     return result
 
 
-# ── Build staging records (cross-cert dedup) ──────────────────────────────────
-
 def build_staging(all_cert_records: dict) -> list:
-    merged = {}  # credly_id/key → record
-
+    merged = {}
     for slug, records in all_cert_records.items():
         cert_code = SLUG_TO_CODE[slug]
         for rec in records:
@@ -161,10 +188,8 @@ def build_staging(all_cert_records: dict) -> list:
             key = cid if cid else f"nocredly_{norm_name(rec.get('name',''))}"
             if not key or key == "nocredly_":
                 continue
-
             loc = rec.get("location", "")
             city, state, country = parse_location(loc)
-
             if key not in merged:
                 merged[key] = {
                     "credly_id":       cid,
@@ -181,16 +206,12 @@ def build_staging(all_cert_records: dict) -> list:
                 }
             else:
                 merged[key]["cert_codes"].add(cert_code)
-
     staging = []
     for r in merged.values():
         r["cert_codes"] = sorted(r["cert_codes"])
         staging.append(r)
-
     return staging
 
-
-# ── Stage into temp table ─────────────────────────────────────────────────────
 
 def create_staging_table(conn):
     with conn.cursor() as cur:
@@ -214,31 +235,25 @@ def create_staging_table(conn):
 
 def insert_staging(conn, records: list):
     with conn.cursor() as cur:
-        for r in records:
-            cur.execute("""
-                INSERT INTO credly_staging VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """, (
-                r["credly_id"], r["credly_username"],
-                r["name"], r["name_norm"], r["location_raw"],
-                r["city"], r["state"], r["country"],
-                r["linkedin_url"], r["linkedin_id"],
-                r["cert_codes"],
-            ))
+        psycopg2.extras.execute_values(cur, """
+            INSERT INTO credly_staging VALUES %s
+        """, [
+            (r["credly_id"], r["credly_username"], r["name"], r["name_norm"],
+             r["location_raw"], r["city"], r["state"], r["country"],
+             r["linkedin_url"], r["linkedin_id"], r["cert_codes"])
+            for r in records
+        ])
     conn.commit()
-    logger.info("  Staged %d records", len(records))
+    print(f"STEP3b done: staged {len(records)} records", flush=True)
 
-
-# ── Match + Enrich ────────────────────────────────────────────────────────────
 
 def enrich_tier(conn, query: str, params, tier: str) -> set:
     with conn.cursor() as cur:
         cur.execute(query, params)
         rows = cur.fetchall()
-
     if not rows:
         logger.info("  [%s] matched=0", tier)
         return set()
-
     matched = set()
     with conn.cursor() as cur:
         for row in rows:
@@ -271,32 +286,35 @@ def enrich_tier(conn, query: str, params, tier: str) -> set:
     return matched
 
 
-# ── Insert unmatched ──────────────────────────────────────────────────────────
-
 def insert_unmatched(conn, records: list, matched: set) -> int:
     unmatched = [r for r in records if r["credly_username"] not in matched]
-    logger.info("  Unmatched (new): %d", len(unmatched))
+    print(f"STEP5: unmatched={len(unmatched)}", flush=True)
     if not unmatched:
         return 0
 
+    BATCH = 500
     inserted = 0
-    with conn.cursor() as cur:
-        for r in unmatched:
+    for i in range(0, len(unmatched), BATCH):
+        batch = unmatched[i:i + BATCH]
+        rows = []
+        for r in batch:
             uid = f"credly_{r['credly_username']}" if r["credly_username"] \
                   else f"credly_{uuid.uuid4().hex[:16]}"
-            cur.execute("""
+            rows.append((
+                uid, r["name"], r["linkedin_url"], r["linkedin_id"],
+                r["city"], r["state"], r["country"], r["location_raw"],
+                r["cert_codes"], r["cert_codes"],
+                json.dumps({"credly_verified": True, "credly_username": r["credly_username"]}),
+            ))
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(cur, """
                 INSERT INTO candidates (
                     uid, name, linkedin_url, linkedin_id,
                     city, state, country, location_raw,
                     certifications, verified_certifications,
                     cert_verification_status, cert_verification_sources,
                     source, added_at, updated_at
-                ) VALUES (
-                    %s,%s,%s,%s,%s,%s,%s,%s,
-                    %s,%s,
-                    'credly_verified', %s,
-                    'credly', now(), now()
-                )
+                ) VALUES %s
                 ON CONFLICT (uid) DO UPDATE SET
                     verified_certifications = (
                         SELECT array_agg(DISTINCT v ORDER BY v)
@@ -307,40 +325,36 @@ def insert_unmatched(conn, records: list, matched: set) -> int:
                     ),
                     cert_verification_status = 'credly_verified',
                     updated_at = now()
-            """, (
-                uid, r["name"], r["linkedin_url"], r["linkedin_id"],
-                r["city"], r["state"], r["country"], r["location_raw"],
-                r["cert_codes"], r["cert_codes"],
-                json.dumps({"credly_verified": True, "credly_username": r["credly_username"]}),
-            ))
+            """, rows, template="(%s,%s,%s,%s,%s,%s,%s,%s,%s::text[],%s::text[],'credly_verified',%s::jsonb,'credly',now(),now())")
             inserted += cur.rowcount
-    conn.commit()
+        conn.commit()
+        print(f"STEP5: batch {min(i+BATCH,len(unmatched))}/{len(unmatched)} inserted={cur.rowcount}", flush=True)
     return inserted
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
 def run():
     logger.info("=== credly-silver-enrich started ===")
+    print("STEP0: run() started", flush=True)
 
-    logger.info("Step 1: Loading consolidated bronze files...")
+    print("STEP1: loading bronze", flush=True)
     all_cert_records = load_all_bronze()
-    logger.info("  Certs loaded: %d", len(all_cert_records))
+    print(f"STEP1 done: {len(all_cert_records)} certs loaded", flush=True)
 
-    logger.info("Step 2: Building staging records (cross-cert dedup)...")
+    print("STEP2: building staging", flush=True)
     staging = build_staging(all_cert_records)
-    logger.info("  Unique Credly candidates: %d", len(staging))
+    print(f"STEP2 done: {len(staging)} unique candidates", flush=True)
 
+    print("STEP3: connecting to DB", flush=True)
     conn = db()
+    print("STEP3: DB connected", flush=True)
 
-    logger.info("Step 3: Staging into temp table...")
+    print("STEP3b: staging into temp table", flush=True)
     create_staging_table(conn)
     insert_staging(conn, staging)
 
-    logger.info("Step 4: Matching & enriching...")
+    print("STEP4: matching", flush=True)
     matched = set()
 
-    # Tier 1: LinkedIn ID
     matched |= enrich_tier(conn, """
         SELECT s.credly_username, s.cert_codes, c.uid
         FROM credly_staging s
@@ -348,7 +362,6 @@ def run():
         WHERE s.linkedin_id != ''
     """, None, "linkedin_id")
 
-    # Tier 2: Name + State (exclude already matched)
     already = list(matched) or ["__none__"]
     matched |= enrich_tier(conn, """
         SELECT s.credly_username, s.cert_codes, c.uid
@@ -360,13 +373,12 @@ def run():
           AND s.credly_username != ALL(%s)
     """, (already,), "name+state")
 
-    logger.info("  Total matched: %d", len(matched))
+    print(f"STEP4 done: matched={len(matched)}", flush=True)
 
-    logger.info("Step 5: Inserting unmatched as new candidates...")
+    print("STEP5: inserting unmatched", flush=True)
     inserted = insert_unmatched(conn, staging, matched)
-    logger.info("  Inserted: %d", inserted)
+    print(f"STEP5 done: inserted={inserted}", flush=True)
 
-    # Ensure GIN index
     with conn.cursor() as cur:
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_candidates_verified_certs_gin
@@ -381,5 +393,15 @@ def run():
     logger.info("  New from Credly          : %d", inserted)
 
 
-if __name__ == "__main__":
+import traceback as _tb
+print("=== credly-silver-enrich: invoking run() ===", flush=True)
+try:
     run()
+    print("=== credly-silver-enrich: run() completed ===", flush=True)
+except Exception as _e:
+    print(f"FATAL ERROR: {_e}", flush=True)
+    _tb.print_exc()
+    raise
+
+# Force stdout flush so Glue captures output
+import sys; sys.stdout.flush()

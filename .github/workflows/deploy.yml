@@ -1,0 +1,96 @@
+name: Deploy — Talent Lake
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: ap-south-1
+  TF_WORKING_DIR: infra/glue
+  SCRIPTS_BUCKET: prajnov-talent-lake
+  SCRIPTS_PREFIX: glue-scripts
+
+jobs:
+  # ── Job 1: Deploy changed Glue scripts to S3 ────────────────────────────────
+  deploy-scripts:
+    name: Sync Glue Scripts → S3
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # needed to detect changed files
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Detect changed Glue scripts
+        id: changed
+        run: |
+          CHANGED=$(git diff --name-only HEAD~1 HEAD -- 'infra/glue/jobs/*.py' 'ingestion/common.py' | tr '\n' ' ')
+          echo "files=$CHANGED" >> $GITHUB_OUTPUT
+          echo "Changed: $CHANGED"
+
+      - name: Upload changed scripts to S3
+        if: steps.changed.outputs.files != ''
+        run: |
+          for f in ${{ steps.changed.outputs.files }}; do
+            if [[ "$f" == infra/glue/jobs/*.py ]]; then
+              SCRIPT=$(basename "$f")
+              aws s3 cp "$f" "s3://${{ env.SCRIPTS_BUCKET }}/${{ env.SCRIPTS_PREFIX }}/$SCRIPT"
+              echo "Uploaded $SCRIPT"
+            fi
+            if [[ "$f" == ingestion/common.py ]]; then
+              aws s3 cp "$f" "s3://${{ env.SCRIPTS_BUCKET }}/${{ env.SCRIPTS_PREFIX }}/common.py"
+              echo "Uploaded common.py"
+            fi
+          done
+
+  # ── Job 2: Terraform plan/apply on infra changes ─────────────────────────────
+  terraform:
+    name: Terraform — infra/glue
+    runs-on: ubuntu-latest
+    needs: deploy-scripts
+
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.7"
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -no-color -out=tfplan
+        env:
+          TF_VAR_pgvector_secret_arn: ${{ secrets.PGVECTOR_SECRET_ARN }}
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: terraform apply -auto-approve tfplan
+        env:
+          TF_VAR_pgvector_secret_arn: ${{ secrets.PGVECTOR_SECRET_ARN }}

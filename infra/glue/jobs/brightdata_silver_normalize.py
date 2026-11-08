@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import boto3
+from botocore.exceptions import ClientError
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -34,7 +35,16 @@ REGION   = _arg("AWS_REGION",        "ap-south-1")
 DB_HOST  = _arg("PGVECTOR_HOST",     "ai-recruiter.c7q8sg00wqte.ap-south-1.rds.amazonaws.com")
 DB_NAME  = _arg("PGVECTOR_DB",       "recruiter")
 DB_USER  = _arg("PGVECTOR_USER",     "prajnov")
-DB_PASS  = _arg("PGVECTOR_PASSWORD", "")
+SECRET_ARN = _arg("PGVECTOR_SECRET_ARN", "arn:aws:secretsmanager:ap-south-1:201727487159:secret:prajnov/recruiter-F8sc3X")
+
+def _get_db_pass() -> str:
+    env_pass = os.getenv("PGVECTOR_PASSWORD", "")
+    if env_pass:
+        return env_pass
+    client = boto3.client("secretsmanager", region_name=REGION)
+    secret = json.loads(client.get_secret_value(SecretId=SECRET_ARN)["SecretString"])
+    return secret.get("PGVECTOR_PASSWORD", "")
+
 STATE_KEY = "glue-state/brightdata_silver_normalize/last_run.json"
 WORKERS   = 20
 
